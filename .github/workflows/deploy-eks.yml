@@ -1,20 +1,21 @@
-name: CI/CD Tienda Perritos ECS
+name: CI/CD Tienda Perritos EKS
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 env:
+  AWS_REGION: us-east-1
   ECR_REPO_FRONTEND: tienda-frontend
   ECR_REPO_BACKEND: tienda-backend
   ECR_REPO_DB: tienda-db
-  ECS_CLUSTER: tienda-cluster
+  EKS_CLUSTER: tienda-cluster
+  EKS_NAMESPACE: tienda
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout código
         uses: actions/checkout@v4
@@ -34,93 +35,44 @@ jobs:
       - name: Definir tag de imagen
         run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
-      # ---------- BUILD & PUSH FRONTEND ----------
-      - name: Build & push FRONTEND
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Build & push Frontend
         run: |
           cd frontend
-          docker build -t $ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG} .
-          docker tag $ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG} $ECR_REGISTRY/${ECR_REPO_FRONTEND}:latest
-          docker push $ECR_REGISTRY/${ECR_REPO_FRONTEND}:${IMAGE_TAG}
-          docker push $ECR_REGISTRY/${ECR_REPO_FRONTEND}:latest
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_FRONTEND:$IMAGE_TAG .
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_FRONTEND:$IMAGE_TAG
 
-      # ---------- BUILD & PUSH BACKEND ----------
-      - name: Build & push BACKEND
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Build & push Backend
         run: |
           cd backend
-          docker build -t $ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG} .
-          docker tag $ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG} $ECR_REGISTRY/${ECR_REPO_BACKEND}:latest
-          docker push $ECR_REGISTRY/${ECR_REPO_BACKEND}:${IMAGE_TAG}
-          docker push $ECR_REGISTRY/${ECR_REPO_BACKEND}:latest
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_BACKEND:$IMAGE_TAG .
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_BACKEND:$IMAGE_TAG
 
-      # ---------- BUILD & PUSH DB ----------
       - name: Build & push DB
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           cd db
-          docker build -t $ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG} .
-          docker tag $ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG} $ECR_REGISTRY/${ECR_REPO_DB}:latest
-          docker push $ECR_REGISTRY/${ECR_REPO_DB}:${IMAGE_TAG}
-          docker push $ECR_REGISTRY/${ECR_REPO_DB}:latest
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_DB:$IMAGE_TAG .
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_DB:$IMAGE_TAG
 
-      # ---------- REGISTER TASK DEFINITION DB ----------
-      - name: Register task definition DB
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Configurar kubectl
         run: |
-          sed "s|:latest|:${IMAGE_TAG}|g" ecs/tienda-db-taskdef.json > /tmp/td-db.json
-          aws ecs register-task-definition --cli-input-json file:///tmp/td-db.json
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
 
-      # ---------- REGISTER TASK DEFINITION BACKEND ----------
-      - name: Register task definition BACKEND
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Actualizar imágenes en EKS
         run: |
-          sed "s|:latest|:${IMAGE_TAG}|g" ecs/tienda-backend-taskdef.json > /tmp/td-backend.json
-          aws ecs register-task-definition --cli-input-json file:///tmp/td-backend.json
+          kubectl set image deployment/tienda-backend -n $EKS_NAMESPACE \
+            backend=${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_BACKEND:$IMAGE_TAG
+          kubectl set image deployment/tienda-frontend -n $EKS_NAMESPACE \
+            frontend=${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_FRONTEND:$IMAGE_TAG
+          kubectl set image deployment/tienda-db -n $EKS_NAMESPACE \
+            mysql=${{ steps.login-ecr.outputs.registry }}/$ECR_REPO_DB:$IMAGE_TAG
 
-      # ---------- REGISTER TASK DEFINITION FRONTEND ----------
-      - name: Register task definition FRONTEND
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Verificar Rollout
         run: |
-          sed "s|:latest|:${IMAGE_TAG}|g" ecs/tienda-frontend-taskdef.json > /tmp/td-frontend.json
-          aws ecs register-task-definition --cli-input-json file:///tmp/td-frontend.json
+          kubectl rollout status deployment/tienda-backend -n $EKS_NAMESPACE --timeout=120s
+          kubectl rollout status deployment/tienda-frontend -n $EKS_NAMESPACE --timeout=120s
+          kubectl rollout status deployment/tienda-db -n $EKS_NAMESPACE --timeout=120s
 
-      # ---------- UPDATE ECS SERVICES ----------
-      - name: Update service DB
+      - name: Estado final
         run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service svc-tienda-db \
-            --task-definition tienda-db \
-            --force-new-deployment
-
-      - name: Update service BACKEND
-        run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service svc-tienda-backend \
-            --task-definition tienda-backend \
-            --force-new-deployment
-
-      - name: Update service FRONTEND
-        run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service svc-tienda-frontend \
-            --task-definition tienda-frontend \
-            --force-new-deployment
-
-      # ---------- VER ESTADO FINAL ----------
-      - name: Ver servicios y tareas
-        run: |
-          aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services svc-tienda-db svc-tienda-backend svc-tienda-frontend \
-            --query "services[*].[serviceName,status,runningCount,desiredCount]" \
-            --output table
+          kubectl get pods -n $EKS_NAMESPACE
+          kubectl get hpa -n $EKS_NAMESPACE
